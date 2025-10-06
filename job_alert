@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+job_alert.py
+
+Daily job aggregator for:
+ - Senior Graphic Designer
+ - Motion Designer
+ - Video Editor
+
+Regions: Hyderabad (India), Europe, Gulf (UAE, KSA, Qatar)
+Sends HTML email to: gouthambollarapu9@gmail.com
+
+Deployment notes:
+ - Designed to be run as a single-run script by a cloud cron (e.g. Render cron job).
+ - Requires environment variables: EMAIL_USER, EMAIL_PASS
+ - Optional: ATTACH_RESUME (path), DEBUG (true/false)
+"""
+
+import os
+import re
+import time
+import sys
+import html
+import traceback
+from datetime import datetime
+from urllib.parse import quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from collections import Counter
+
+# Email libs
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+
+# ---------- Configuration ----------
+EMAIL_TO = os.environ.get("EMAIL_USER", "gouthambollarapu9@gmail.com")
+EMAIL_FROM = EMAIL_TO  # sends from the same account
+SEND_DISPLAY_NAME = "Goutham Bollarapu"  # will appear as "Goutham Bollarapu <EMAIL_FROM>"
+
+# Regions and search queries
+REGIONS = {
+    "Hyderabad, India": "Hyderabad",
+    "Europe": "Europe",
+    "Gulf (UAE OR Saudi Arabia OR Qatar)": "UAE OR Saudi Arabia OR Qatar"
+}
+JOB_KEYWORDS = ["Senior Graphic Designer", "Senior Motion Designer", "Senior Motion Graphics Designer", "Senior Video Editor", "Video Editor", "Motion Designer"]
+
+# Max results per source per region
+MAX_RESULTS_PER_SOURCE = 6
+
+# HTTP
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9"
+}
+
+# Timeout and polite scraping
+REQUEST_TIMEOUT = 12
+SLEEP_BETWEEN_REQUESTS = 1.2
+
+# ---------- Utilities ----------
+def safe_get(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        return r.text
+    except Exception as e:
+        print(f"[WARN] Failed get: {url} -> {e}")
+        return ""
+
+def normalize_text(t):
+    if not t:
+        return ""
+    return re.sub(r"\s+", " ", t).strip()
+
+STOPWORDS = set([
+    # short list; the script uses simple frequency extraction — for production, swap with nltk/spacy stopwords
+    "the","and","or","to","a","of","in","with","for","as","is","on","by","an","be","that","this","are","at","from","we","you","will","experience","years","year"
+])
+
+def extract_top_keywords(text, topn=5):
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
+    words = [w for w in text.split() if len(w) > 2 and w not in STOPWORDS]
+    cn = Counter(words)
+    most = [w for w,_ in cn.most_common(topn)]
+    return most
+
+def extract_tech_skills(text, topn=5):
+    # Look for common design/video tools and return the ones found, otherwise fall back to frequency
+    tools = [
+        "after effects","premiere pro","premiere","photoshop","illustrator","indesign","figma",
+        "davinci","davinci resolve","resolve","final cut","final cut pro","c4d","cinema 4d",
+        "blender","ae","pr","audition","audacity","motion","maya","nuke","sfc","html","css",
+        "javascript","spline","resolve","lightroom"
+    ]
+    found = []
+    tlower = text.lower()
+    for tool in tools:
+        if tool in tlower:
+            found.append(tool.title().replace("Pr", "Premiere Pro").replace("Ae", "After Effects"))
+    # dedupe and limit
+    if found:
+        uniq = []
+        for f in found:
+            if f not in uniq:
+                uniq.append(f)
+        return uniq[:topn]
+    # fallback
+    return extract_top_keywords(text, topn)
+
+# ---------- Source-specific scrapers ----------
+# Each function returns list of dicts: {title, company, location, url, summary_text}
+# NOTE: These scrapers target public pages and are intentionally simple — they may break if the target changes.
+
+def search_indeed(query, region_query, max_results=MAX_RESULTS_PER_SOURCE):
+    results = []
+    # Build search url (Indeed global)
+    q = quote_plus(query + " " + region_query)
+    url = f"https://www.indeed.com/jobs?q={q}&l="
+    html_text = safe_get(url)
+    if not html_text:
+        return results
+    soup = BeautifulSoup(html_text, "lxml")
+    cards = soup.select("a.tapItem")[:max_results]
+    for a in cards:
+        try:
+            title = normalize_text(a.select_one("h2.jobTitle").get_text() if a.select_one("h2.jobTitle") else a.get_text())
+            company = normalize_text(a.select_one("span.companyName").get_text() if a.select_one("span.companyName") else "")
+            location = normalize_text(a.select_one("div.companyLocation").get_text() if a.select_one("div.companyLocation") else region_query)
+            href = a.get("href")
+            if href and not href.startswith("http"):
+                href = "https://www.indeed.com" + href
+            summary = ""
+            results.append({"title": title, "company": company, "location": location, "url": href, "summary": summary})
+        except Exception:
+            continue
+    return results
+
+def search_glassdoor(query, region_query, max_results=MAX_RESULTS_PER_SOURCE):
+    results = []
+    q = quote_plus(query + " " + region_query)
+    # Glassdoor often blocks scraping — we try public search page
+    url = f"https://www.glassdoor.com/Job/jobs.htm?sc.keyword={q}"
+    html_text = safe_get(url)
+    if not html_text:
+        return results
+    soup = BeautifulSoup(html_text, "lxml")
+    cards = soup.select("li.react-job-listing")[:max_results]
+    for c in cards:
+        try:
+            title = normalize_text(c.select_one(".jobLink").get_text() if c.select_one(".jobLink") else c.get_text())
+            company = normalize_text(c.select_one(".jobEmpolyerName").get_text() if c.select_one(".jobEmpolyerName") else "")
+            location = normalize_text(c.select_one(".loc").get_text() if c.select_one(".loc") else region_query)
+            link = c.select_one("a.jobLink")
+            href = link.get("href") if link else None
+            if href and not href.startswith("http"):
+                href = "https://www.glassdoor.com" + href
+            results.append({"title": title, "company": company, "location": location, "url": href, "summary": ""})
+        except Exception:
+            continue
+    return results
+
+def search_naukrigulf(query, region_query, max_results=MAX_RESULTS_PER_SOURCE):
+    # NaukriGulf public search
+    results = []
+    q = quote_plus(query + " " + region_query)
+    url = f"https://www.naukrigulf.com/jobs-in-gulf?q={q}"
+    html_text = safe_get(url)
+    if not html_text:
+        return results
+    soup = BeautifulSoup(html_text, "lxml")
+    cards = soup.select("article.jobTuple")[:max_results]
+    for c in cards:
+        try:
+            title = normalize_text(c.select_one("h2").get_text() if c.select_one("h2") else "")
+            company = normalize_text(c.select_one(".companyName").get_text() if c.select_one(".companyName") else "")
+            location = normalize_text(c.select_one(".loc").get_text() if c.select_one(".loc") else region_query)
+            link = c.select_one("a")
+            href = link.get("href") if link else None
+            if href and href.startswith("/"):
+                href = "https://www.naukrigulf.com" + href
+            results.append({"title": title, "company": company, "location": location, "url": href, "summary": ""})
+        except Exception:
+            continue
+    return results
+
+def search_remote_rocket(query, region_query, max_results=MAX_RESULTS_PER_SOURCE):
+    # Remote job lists - generic search page
+    results = []
+    q = quote_plus(query)
+    url = f"https://remoterocketship.com/search?keyword={q}"
+    html_text = safe_get(url)
+    if not html_text:
+        return results
+    soup = BeautifulSoup(html_text, "lxml")
+    cards = soup.select("div.job-item")[:max_results]
+    for c in cards:
+        try:
+            title = normalize_text(c.select_one(".job-title a").get_text() if c.select_one(".job-title a") else "")
+            company = normalize_text(c.select_one(".company-name").get_text() if c.select_one(".company-name") else "")
+            location = normalize_text(c.select_one(".location").get_text() if c.select_one(".location") else region_query)
+            href = c.select_one(".job-title a").get("href") if c.select_one(".job-title a") else None
+            if href and href.startswith("/"):
+                href = "https://remoterocketship.com" + href
+            results.append({"title": title, "company": company, "location": location, "url": href, "summary": ""})
+        except Exception:
+            continue
+    return results
+
+def search_linkedin_public(query, region_query, max_results=MAX_RESULTS_PER_SOURCE):
+    # LinkedIn public search (only public pages without login)
+    results = []
+    q = quote_plus(query + " " + region_query)
+    url = f"https://www.linkedin.com/jobs/search?keywords={q}"
+    html_text = safe_get(url)
+    if not html_text:
+        return results
+    soup = BeautifulSoup(html_text, "lxml")
+    # LinkedIn renders a lot client-side; attempt basic scraping
+    cards = soup.select("a.result-card__full-card-link")[:max_results]
+    if not cards:
+        cards = soup.select("a.jobs-search-results__list-item")[:max_results]
+    for a in cards:
+        try:
+            title = normalize_text(a.get_text())
+            href = a.get("href")
+            results.append({"title": title, "company": "", "location": region_query, "url": href, "summary": ""})
+        except Exception:
+            continue
+    return results
+
+# ---------- Main aggregator ----------
+def aggregate_jobs():
+    all_jobs = []
+    sources = [
+        ("Indeed", search_indeed),
+        ("Glassdoor", search_glassdoor),
+        ("NaukriGulf", search_naukrigulf),
+        ("RemoteRocketship", search_remote_rocket),
+        ("LinkedIn", search_linkedin_public)
+    ]
+    for region_name, region_q in REGIONS.items():
+        for keyword in JOB_KEYWORDS:
+            for src_name, func in sources:
+                try:
+                    items = func(keyword, region_q)
+                    # annotate
+                    for it in items:
+                        it["source"] = src_name
+                        it["search_keyword"] = keyword
+                        it["region"] = region_name
+                        all_jobs.append(it)
+                except Exception as e:
+                    print(f"[WARN] Source {src_name} failed for {keyword} / {region_q}: {e}")
+    # Deduplicate by url or (title+company+location)
+    seen = set()
+    deduped = []
+    for j in all_jobs:
+        key = j.get("url") or (j.get("title","") + j.get("company","") + j.get("location",""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(j)
+    return deduped
+
+# ---------- Enrich jobs (fetch JD snippet, extract keywords & skills) ----------
+def enrich_jobs(jobs):
+    enriched = []
+    for j in jobs:
+        try:
+            summary_text = ""
+            if j.get("url"):
+                page = safe_get(j["url"])
+                if page:
+                    soup = BeautifulSoup(page, "lxml")
+                    # Try to get description paragraphs
+                    desc = soup.find(lambda tag: tag.name in ["div","section"] and ("description" in (tag.get("class") or []) or "jobDescription" in (tag.get("id") or "")))
+                    if not desc:
+                        # fallback: get big text blocks
+                        desc = soup.find("div") or soup.find("body")
+                    summary_text = normalize_text(desc.get_text() if desc else "")
+            else:
+                summary_text = j.get("summary","")
+        except Exception:
+            summary_text = j.get("summary","")
+        # Extract keywords & tech skills
+        keywords = extract_top_keywords(summary_text + " " + j.get("title"," ") + " " + j.get("company"," "))
+        tech_skills = extract_tech_skills(summary_text + " " + j.get("title"," "))
+        enriched.append({
+            "Title": j.get("title","").strip(),
+            "Company": j.get("company","").strip(),
+            "Location": j.get("location","").strip(),
+            "URL": j.get("url",""),
+            "Source": j.get("source",""),
+            "TopKeywords": ", ".join(keywords[:5]),
+            "TopTechSkills": ", ".join(tech_skills[:5]),
+            "Region": j.get("region",""),
+            "SearchKeyword": j.get("search_keyword","")
+        })
+    return enriched
+
+# ---------- Email builder ----------
+def build_html_email(df):
+    now = datetime.now().strftime("%d %b %Y %H:%M")
+    header = f"<h2>Daily Job Digest — Senior Graphic / Motion / Video Roles</h2><p>Generated: {now} (IST)</p>"
+    # convert df to html table with desired columns
+    cols = ["Title","Company","Location","URL","TopKeywords","TopTechSkills","Source","Region"]
+    html_table = df[cols].to_html(index=False, escape=False, render_links=True)
+    note = "<p>Notes: Links are direct job links when available. Some listings may require login on the target site (e.g. LinkedIn).</p>"
+    footer = f"<p>Job alert generated for <strong>{html.escape(EMAIL_TO)}</strong></p>"
+    return header + html_table + note + footer
+
+# ---------- Email send ----------
+def send_email(subject, html_body, attachments=None):
+    user = os.environ.get("EMAIL_USER")
+    pwd = os.environ.get("EMAIL_PASS")
+    if not user or not pwd:
+        raise RuntimeError("EMAIL_USER and EMAIL_PASS environment variables must be set.")
+    msg = MIMEMultipart()
+    msg["From"] = f"{SEND_DISPLAY_NAME} <{EMAIL_FROM}>"
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+    # attachments: list of file paths
+    if attachments:
+        for path in attachments:
+            try:
+                with open(path, "rb") as f:
+                    part = MIMEApplication(f.read(), Name=os.path.basename(path))
+                    part['Content-Disposition'] = f'attachment; filename="{os.path.basename(path)}"'
+                    msg.attach(part)
+            except Exception as e:
+                print(f"[WARN] Could not attach {path}: {e}")
+    # send via Gmail SMTP
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.login(user, pwd)
+        server.send_message(msg)
+        server.quit()
+        print("[INFO] Email sent successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to send email: {e}")
+        raise
+
+# ---------- Main ----------
+def main():
+    try:
+        print("[INFO] Aggregating jobs...")
+        jobs = aggregate_jobs()
+        print(f"[INFO] Collected {len(jobs)} raw jobs. Enriching...")
+        enriched = enrich_jobs(jobs)
+        if not enriched:
+            print("[INFO] No jobs found today. Sending empty notice.")
+            subject = f"Daily Job Digest — No new matches — {datetime.now().date()}"
+            html_body = "<p>No new job matches were found for today. I'll try again tomorrow at 09:00 IST.</p>"
+            send_email(subject, html_body)
+            return
+        df = pd.DataFrame(enriched)
+        # For email table: make URL clickable html
+        df["URL"] = df["URL"].apply(lambda u: f'<a href="{u}">Apply / View</a>' if u else "")
+        html_body = build_html_email(df)
+        subject = f"Daily Job Digest: {len(df)} matches — {datetime.now().strftime('%d %b %Y')}"
+        # Optionally attach resume if path provided via env ATTACH_RESUME
+        attachments = []
+        attach_path = os.environ.get("ATTACH_RESUME")
+        if attach_path and os.path.exists(attach_path):
+            attachments.append(attach_path)
+        send_email(subject, html_body, attachments=attachments)
+    except Exception as e:
+        print("[ERROR] Main failed:", e)
+        traceback.print_exc()
+        # send failure email to yourself (best effort)
+        try:
+            subject = "Job Alert Bot — Failure Notification"
+            body = f"<p>Error during job aggregation: {html.escape(str(e))}</p><pre>{html.escape(traceback.format_exc())}</pre>"
+            send_email(subject, body)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
